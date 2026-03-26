@@ -77,6 +77,44 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ─── Unified Data Fetch (solves cold start slow loading) ───
+app.get('/api/all', async (req, res) => {
+  try {
+    const [profile, skills, projects, experience, certifications, education, achievements, messages] = await Promise.all([
+      models.UserProfile.findOne() || {},
+      models.Skill.find().sort({ order_index: 1, _id: -1 }),
+      models.Project.find().sort({ order_index: 1, _id: -1 }),
+      models.Experience.find().sort({ order_index: 1, _id: -1 }),
+      models.Certification.find().sort({ order_index: 1, _id: -1 }),
+      models.Education.find().sort({ order_index: 1, _id: -1 }),
+      models.Achievement.find().sort({ order_index: 1, _id: -1 }),
+      models.Message.find().sort({ created_at: -1 })
+    ]);
+
+    // Handle edge case if profile doesn't exist yet
+    let profileData = profile;
+    if (!profileData) {
+      profileData = await models.UserProfile.create({
+        name: "Your Name",
+        welcome_message: "Welcome to my portfolio!"
+      });
+    }
+
+    res.json({
+      profile: profileData,
+      skills,
+      projects,
+      experience,
+      certifications,
+      education,
+      achievements,
+      messages
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Helper for standard GET/POST/DELETE with Mongoose ---
 function setupCrud(endpoint, Model, requiredFields) {
   app.get(`/api/${endpoint}`, async (req, res) => {
