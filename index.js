@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const nodemailer = require('nodemailer');
 const { v2: cloudinary } = require('cloudinary');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const streamifier = require('streamifier');
 require('dotenv').config();
 
 const connectDB = require('./db');
@@ -16,6 +16,30 @@ const PORT = process.env.PORT || 5000;
 
 // Connect to MongoDB
 connectDB();
+
+// Configure Cloudinary if credentials exist
+if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+  });
+  console.log('Cloudinary configured for image uploads');
+}
+
+// Helper: upload a buffer to Cloudinary, returns the secure URL
+const uploadToCloudinary = (buffer, folder = 'portfolio') => {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, allowed_formats: ['jpg', 'png', 'jpeg', 'webp', 'gif'] },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result.secure_url);
+      }
+    );
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
+};
 
 // Email transporter (Gmail)
 const transporter = nodemailer.createTransport({
@@ -34,43 +58,17 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Setup uploads folder logic for local fallback
+// Setup uploads folder (local fallback if no Cloudinary)
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
 app.use('/uploads', express.static(uploadDir));
 
-// Setup Cloudinary or Local Multer
-let upload;
-if (process.env.CLOUDINARY_CLOUD_NAME) {
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-  });
-  const storage = new CloudinaryStorage({
-    cloudinary: cloudinary,
-    params: {
-      folder: 'portfolio',
-      allowed_formats: ['jpg', 'png', 'jpeg', 'webp', 'gif']
-    }
-  });
-  upload = multer({ storage: storage });
-  console.log('Using Cloudinary for image uploads');
-} else {
-  const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-      cb(null, uploadDir)
-    },
-    filename: function (req, file, cb) {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-      cb(null, uniqueSuffix + '-' + file.originalname);
-    }
-  });
-  upload = multer({ storage: storage });
-  console.log('WARN: Cloudinary not configured. Using local uploads (will clear on Render restart).');
-}
+// Use memoryStorage for all uploads — works with both Cloudinary and local fallback
+const upload = multer({ storage: multer.memoryStorage() });
+console.log('Using multer memoryStorage (uploads via direct Cloudinary stream or local fallback)');
+
 
 // ─── Health Check (used for keep-alive pings from frontend) ───
 app.get('/health', (req, res) => {
@@ -179,17 +177,27 @@ app.put('/api/profile', upload.fields([{ name: 'profile_image', maxCount: 1 }, {
       if (req.body[field] !== undefined) profile[field] = req.body[field];
     });
 
-    // Update images — Cloudinary gives full URL, local gives filename only
+    // Upload images
     if (req.files) {
       if (req.files.profile_image) {
-        profile.profile_image = process.env.CLOUDINARY_CLOUD_NAME 
-          ? req.files.profile_image[0].path  // Full Cloudinary URL
-          : `/uploads/${req.files.profile_image[0].filename}`;
+        const buf = req.files.profile_image[0].buffer;
+        if (process.env.CLOUDINARY_CLOUD_NAME) {
+          profile.profile_image = await uploadToCloudinary(buf);
+        } else {
+          const fname = `${Date.now()}-profile${path.extname(req.files.profile_image[0].originalname)}`;
+          fs.writeFileSync(path.join(uploadDir, fname), buf);
+          profile.profile_image = `/uploads/${fname}`;
+        }
       }
       if (req.files.college_image) {
-        profile.college_image = process.env.CLOUDINARY_CLOUD_NAME 
-          ? req.files.college_image[0].path  // Full Cloudinary URL
-          : `/uploads/${req.files.college_image[0].filename}`;
+        const buf = req.files.college_image[0].buffer;
+        if (process.env.CLOUDINARY_CLOUD_NAME) {
+          profile.college_image = await uploadToCloudinary(buf);
+        } else {
+          const fname = `${Date.now()}-college${path.extname(req.files.college_image[0].originalname)}`;
+          fs.writeFileSync(path.join(uploadDir, fname), buf);
+          profile.college_image = `/uploads/${fname}`;
+        }
       }
     }
     
@@ -220,7 +228,13 @@ app.post('/api/projects', upload.single('image'), async (req, res) => {
 
     let image_url = null;
     if (req.file) {
-      image_url = process.env.CLOUDINARY_CLOUD_NAME ? req.file.path : `/uploads/${req.file.filename}`;
+      if (process.env.CLOUDINARY_CLOUD_NAME) {
+        image_url = await uploadToCloudinary(req.file.buffer);
+      } else {
+        const fname = `${Date.now()}-proj${path.extname(req.file.originalname)}`;
+        fs.writeFileSync(path.join(uploadDir, fname), req.file.buffer);
+        image_url = `/uploads/${fname}`;
+      }
     }
 
     const project = new models.Project({
@@ -264,7 +278,13 @@ app.post('/api/achievements', upload.single('image'), async (req, res) => {
 
     let image_url = null;
     if (req.file) {
-      image_url = process.env.CLOUDINARY_CLOUD_NAME ? req.file.path : `/uploads/${req.file.filename}`;
+      if (process.env.CLOUDINARY_CLOUD_NAME) {
+        image_url = await uploadToCloudinary(req.file.buffer);
+      } else {
+        const fname = `${Date.now()}-ach${path.extname(req.file.originalname)}`;
+        fs.writeFileSync(path.join(uploadDir, fname), req.file.buffer);
+        image_url = `/uploads/${fname}`;
+      }
     }
 
     const achievement = new models.Achievement({ title, date, description, image_url });
