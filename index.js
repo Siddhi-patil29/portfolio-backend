@@ -8,32 +8,14 @@ const { v2: cloudinary } = require('cloudinary');
 const streamifier = require('streamifier');
 require('dotenv').config();
 
-const db = require('./database');
+const connectDB = require('./db');
+const models = require('./models');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// SQLite helper promises
-const dbRun = (query, params = []) => new Promise((resolve, reject) => {
-  db.run(query, params, function(err) {
-    if (err) reject(err);
-    else resolve(this);
-  });
-});
-
-const dbAll = (query, params = []) => new Promise((resolve, reject) => {
-  db.all(query, params, (err, rows) => {
-    if (err) reject(err);
-    else resolve(rows);
-  });
-});
-
-const dbGet = (query, params = []) => new Promise((resolve, reject) => {
-  db.get(query, params, (err, row) => {
-    if (err) reject(err);
-    else resolve(row);
-  });
-});
+// Connect to MongoDB
+connectDB();
 
 // Configure Cloudinary if credentials exist
 if (process.env.CLOUDINARY_CLOUD_NAME) {
@@ -83,64 +65,59 @@ if (!fs.existsSync(uploadDir)) {
 }
 app.use('/uploads', express.static(uploadDir));
 
-// Use memoryStorage for all uploads
+// Use memoryStorage for all uploads — works with both Cloudinary and local fallback
 const upload = multer({ storage: multer.memoryStorage() });
+console.log('Using multer memoryStorage (uploads via direct Cloudinary stream or local fallback)');
 
-// ─── Health Check ───
+
+// ─── Health Check (used for keep-alive pings from frontend) ───
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Unified Data Fetch ───
+// ─── Unified Data Fetch (solves cold start slow loading) ───
 app.get('/api/all', async (req, res) => {
-  const isMinimal = req.query.minimal === 'true';
-  console.time(`Fetch All ${isMinimal ? '(minimal)' : '(full)'}`);
-  
   try {
-    const fetchTasks = [
-      dbGet("SELECT * FROM user_profile LIMIT 1"),
-      dbAll("SELECT * FROM skills ORDER BY order_index ASC, id DESC"),
-      dbAll("SELECT * FROM projects ORDER BY order_index ASC, id DESC"),
-      dbAll("SELECT * FROM experience ORDER BY order_index ASC, id DESC"),
-      dbAll("SELECT * FROM certifications ORDER BY order_index ASC, id DESC"),
-      dbAll("SELECT * FROM education ORDER BY order_index ASC, id DESC"),
-      dbAll("SELECT * FROM achievements ORDER BY order_index ASC, id DESC")
-    ];
+    const [profile, skills, projects, experience, certifications, education, achievements, messages] = await Promise.all([
+      models.UserProfile.findOne() || {},
+      models.Skill.find().sort({ order_index: 1, _id: -1 }),
+      models.Project.find().sort({ order_index: 1, _id: -1 }),
+      models.Experience.find().sort({ order_index: 1, _id: -1 }),
+      models.Certification.find().sort({ order_index: 1, _id: -1 }),
+      models.Education.find().sort({ order_index: 1, _id: -1 }),
+      models.Achievement.find().sort({ order_index: 1, _id: -1 }),
+      models.Message.find().sort({ created_at: -1 })
+    ]);
 
-    if (!isMinimal) {
-      fetchTasks.push(dbAll("SELECT * FROM messages ORDER BY created_at DESC"));
-    }
-
-    const results = await Promise.all(fetchTasks);
-    console.timeEnd(`Fetch All ${isMinimal ? '(minimal)' : '(full)'}`);
-
-    let profileData = results[0];
+    // Handle edge case if profile doesn't exist yet
+    let profileData = profile;
     if (!profileData) {
-      const resId = await dbRun("INSERT INTO user_profile (name, welcome_message) VALUES (?, ?)", ["Your Name", "Welcome to my portfolio!"]);
-      profileData = { id: resId.lastID, name: "Your Name", welcome_message: "Welcome to my portfolio!" };
+      profileData = await models.UserProfile.create({
+        name: "Your Name",
+        welcome_message: "Welcome to my portfolio!"
+      });
     }
 
     res.json({
       profile: profileData,
-      skills: results[1],
-      projects: results[2],
-      experience: results[3],
-      certifications: results[4],
-      education: results[5],
-      achievements: results[6],
-      messages: isMinimal ? [] : (results[7] || [])
+      skills,
+      projects,
+      experience,
+      certifications,
+      education,
+      achievements,
+      messages
     });
   } catch (err) {
-    console.timeEnd(`Fetch All ${isMinimal ? '(minimal)' : '(full)'}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- Helper for standard GET/POST/DELETE with SQLite ---
-function setupCrud(endpoint, table, requiredFields) {
+// --- Helper for standard GET/POST/DELETE with Mongoose ---
+function setupCrud(endpoint, Model, requiredFields) {
   app.get(`/api/${endpoint}`, async (req, res) => {
     try {
-      const rows = await dbAll(`SELECT * FROM ${table} ORDER BY order_index ASC, id DESC`);
+      const rows = await Model.find().sort({ order_index: 1, _id: -1 });
       res.json(rows);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -152,14 +129,9 @@ function setupCrud(endpoint, table, requiredFields) {
       for(let field of requiredFields) {
         if(!req.body[field]) return res.status(400).json({ error: `Missing ${field}` });
       }
-      
-      const fields = Object.keys(req.body);
-      const values = Object.values(req.body);
-      const placeholders = fields.map(() => '?').join(', ');
-      
-      const insertResult = await dbRun(`INSERT INTO ${table} (${fields.join(', ')}) VALUES (${placeholders})`, values);
-      req.body.id = insertResult.lastID;
-      res.json(req.body);
+      const newDoc = new Model(req.body);
+      await newDoc.save();
+      res.json(newDoc);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -167,7 +139,7 @@ function setupCrud(endpoint, table, requiredFields) {
 
   app.delete(`/api/${endpoint}/:id`, async (req, res) => {
     try {
-      await dbRun(`DELETE FROM ${table} WHERE id = ?`, [req.params.id]);
+      await Model.findByIdAndDelete(req.params.id);
       res.json({ message: 'Deleted' });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -175,13 +147,16 @@ function setupCrud(endpoint, table, requiredFields) {
   });
 }
 
-// 1. User Profile 
+// 1. User Profile (Special GET/PUT since it's a single record)
 app.get('/api/profile', async (req, res) => {
   try {
-    let profile = await dbGet("SELECT * FROM user_profile LIMIT 1");
+    let profile = await models.UserProfile.findOne();
     if (!profile) {
-      const resId = await dbRun("INSERT INTO user_profile (name, welcome_message) VALUES (?, ?)", ["Your Name", "Welcome to my portfolio!"]);
-      profile = { id: resId.lastID, name: "Your Name", welcome_message: "Welcome to my portfolio!" };
+      // Seed initial profile empty
+      profile = await models.UserProfile.create({
+        name: "Your Name",
+        welcome_message: "Welcome to my portfolio!"
+      });
     }
     res.json(profile);
   } catch (err) {
@@ -191,71 +166,55 @@ app.get('/api/profile', async (req, res) => {
 
 app.put('/api/profile', upload.fields([{ name: 'profile_image', maxCount: 1 }, { name: 'college_image', maxCount: 1 }]), async (req, res) => {
   try {
-    let profile = await dbGet("SELECT * FROM user_profile LIMIT 1");
+    let profile = await models.UserProfile.findOne();
     if (!profile) {
-      const resId = await dbRun("INSERT INTO user_profile (name, welcome_message) VALUES (?, ?)", ["Your Name", "Welcome to my portfolio!"]);
-      profile = { id: resId.lastID };
+      profile = new models.UserProfile();
     }
     
-    const params = [];
-    let setClauses = [];
+    // Update string fields
     const fieldsToUpdate = ['name', 'field', 'university', 'location', 'career_goal', 'tagline', 'about_background', 'about_interests', 'journey_text', 'social_github', 'social_linkedin', 'social_instagram', 'social_email', 'resume_url', 'welcome_message'];
-    
     fieldsToUpdate.forEach(field => {
-      if (req.body[field] !== undefined) {
-         setClauses.push(`${field} = ?`);
-         params.push(req.body[field]);
-      }
+      if (req.body[field] !== undefined) profile[field] = req.body[field];
     });
 
+    // Upload images
     if (req.files) {
       if (req.files.profile_image) {
         const buf = req.files.profile_image[0].buffer;
-        let imgUrl;
         if (process.env.CLOUDINARY_CLOUD_NAME) {
-          imgUrl = await uploadToCloudinary(buf);
+          profile.profile_image = await uploadToCloudinary(buf);
         } else {
           const fname = `${Date.now()}-profile${path.extname(req.files.profile_image[0].originalname)}`;
           fs.writeFileSync(path.join(uploadDir, fname), buf);
-          imgUrl = `/uploads/${fname}`;
+          profile.profile_image = `/uploads/${fname}`;
         }
-        setClauses.push("profile_image = ?");
-        params.push(imgUrl);
       }
       if (req.files.college_image) {
         const buf = req.files.college_image[0].buffer;
-        let imgUrl;
         if (process.env.CLOUDINARY_CLOUD_NAME) {
-          imgUrl = await uploadToCloudinary(buf);
+          profile.college_image = await uploadToCloudinary(buf);
         } else {
           const fname = `${Date.now()}-college${path.extname(req.files.college_image[0].originalname)}`;
           fs.writeFileSync(path.join(uploadDir, fname), buf);
-          imgUrl = `/uploads/${fname}`;
+          profile.college_image = `/uploads/${fname}`;
         }
-        setClauses.push("college_image = ?");
-        params.push(imgUrl);
       }
     }
     
-    if (setClauses.length > 0) {
-      params.push(profile.id);
-      await dbRun(`UPDATE user_profile SET ${setClauses.join(', ')} WHERE id = ?`, params);
-    }
-
-    const updatedProfile = await dbGet("SELECT * FROM user_profile LIMIT 1");
-    res.json({ success: true, profile: updatedProfile });
+    await profile.save();
+    res.json({ success: true, profile });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // 2. Skills
-setupCrud('skills', 'skills', ['name', 'category']);
+setupCrud('skills', models.Skill, ['name', 'category']);
 
-// 3. Projects 
+// 3. Projects (Custom because of potential image uploads)
 app.get('/api/projects', async (req, res) => {
   try {
-    const projects = await dbAll("SELECT * FROM projects ORDER BY order_index ASC, id DESC");
+    const projects = await models.Project.find().sort({ order_index: 1, _id: -1 });
     res.json(projects);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -278,12 +237,10 @@ app.post('/api/projects', upload.single('image'), async (req, res) => {
       }
     }
 
-    const resId = await dbRun(
-      "INSERT INTO projects (title, problem, solution, tools, role, outcome, image_url, github_url, live_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [title, problem, solution, tools, role, outcome, image_url, github_url, live_url]
-    );
-
-    const project = await dbGet("SELECT * FROM projects WHERE id = ?", [resId.lastID]);
+    const project = new models.Project({
+       title, problem, solution, tools, role, outcome, image_url, github_url, live_url
+    });
+    await project.save();
     res.json(project);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -292,7 +249,7 @@ app.post('/api/projects', upload.single('image'), async (req, res) => {
 
 app.delete('/api/projects/:id', async (req, res) => {
   try {
-    await dbRun("DELETE FROM projects WHERE id = ?", [req.params.id]);
+    await models.Project.findByIdAndDelete(req.params.id);
     res.json({ message: 'Deleted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -300,14 +257,14 @@ app.delete('/api/projects/:id', async (req, res) => {
 });
 
 // 4. Experience, Certifications, Education
-setupCrud('experience', 'experience', ['role', 'company']);
-setupCrud('certifications', 'certifications', ['title']);
-setupCrud('education', 'education', ['degree', 'institution']);
+setupCrud('experience', models.Experience, ['role', 'company']);
+setupCrud('certifications', models.Certification, ['title']);
+setupCrud('education', models.Education, ['degree', 'institution']);
 
 // 5. Achievements
 app.get('/api/achievements', async (req, res) => {
   try {
-    const achievements = await dbAll("SELECT * FROM achievements ORDER BY order_index ASC, id DESC");
+    const achievements = await models.Achievement.find().sort({ order_index: 1, _id: -1 });
     res.json(achievements);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -330,11 +287,8 @@ app.post('/api/achievements', upload.single('image'), async (req, res) => {
       }
     }
 
-    const resId = await dbRun(
-      "INSERT INTO achievements (title, date, description, image_url) VALUES (?, ?, ?, ?)",
-      [title, date, description, image_url]
-    );
-    const achievement = await dbGet("SELECT * FROM achievements WHERE id = ?", [resId.lastID]);
+    const achievement = new models.Achievement({ title, date, description, image_url });
+    await achievement.save();
     res.json(achievement);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -343,7 +297,7 @@ app.post('/api/achievements', upload.single('image'), async (req, res) => {
 
 app.delete('/api/achievements/:id', async (req, res) => {
   try {
-    await dbRun("DELETE FROM achievements WHERE id = ?", [req.params.id]);
+    await models.Achievement.findByIdAndDelete(req.params.id);
     res.json({ message: 'Deleted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -356,7 +310,8 @@ app.post('/api/contact', async (req, res) => {
     const { name, email, message } = req.body;
     if (!name || !message) return res.status(400).json({ error: 'Name and message are required' });
     
-    const resId = await dbRun("INSERT INTO messages (name, email, message) VALUES (?, ?, ?)", [name, email, message]);
+    const newMsg = new models.Message({ name, email, message });
+    await newMsg.save();
       
     // Send email
     if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
@@ -371,7 +326,7 @@ app.post('/api/contact', async (req, res) => {
       });
     }
 
-    res.json({ success: true, id: resId.lastID });
+    res.json({ success: true, id: newMsg._id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -379,7 +334,7 @@ app.post('/api/contact', async (req, res) => {
 
 app.get('/api/contact', async (req, res) => {
   try {
-    const messages = await dbAll("SELECT * FROM messages ORDER BY created_at DESC");
+    const messages = await models.Message.find().sort({ created_at: -1 });
     res.json(messages);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -392,17 +347,29 @@ app.put('/api/:table/reorder', async (req, res) => {
     const { table } = req.params;
     const { orderedIds } = req.body;
     
-    const validTables = ['skills', 'projects', 'experience', 'certifications', 'education', 'achievements'];
+    const validTables = {
+      'skills': models.Skill,
+      'projects': models.Project,
+      'experience': models.Experience,
+      'certifications': models.Certification,
+      'education': models.Education,
+      'achievements': models.Achievement
+    };
     
-    if (!validTables.includes(table)) return res.status(400).json({ error: 'Invalid table for reordering' });
+    const Model = validTables[table];
+    if (!Model) return res.status(400).json({ error: 'Invalid table for reordering' });
     if (!orderedIds || !Array.isArray(orderedIds)) return res.status(400).json({ error: 'orderedIds must be an array' });
     if (orderedIds.length === 0) return res.json({ success: true });
 
     // Update each record's order_index
-    for(let index = 0; index < orderedIds.length; index++) {
-        await dbRun(`UPDATE ${table} SET order_index = ? WHERE id = ?`, [index, orderedIds[index]]);
-    }
+    const bulkOps = orderedIds.map((id, index) => ({
+      updateOne: {
+        filter: { _id: id },
+        update: { order_index: index }
+      }
+    }));
     
+    await Model.bulkWrite(bulkOps);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
